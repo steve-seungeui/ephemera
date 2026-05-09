@@ -56,7 +56,7 @@ echo "==> 3. Installing Debian Bookworm minbase via debootstrap <=="
 #   ca-certificates: for HTTPS LLM API calls from within the VM
 debootstrap \
     --variant=minbase \
-    --include=libgomp1,ca-certificates,tzdata \
+    --include=libgomp1,ca-certificates,tzdata,iproute2 \
     bookworm "$MNT_DIR" http://deb.debian.org/debian/
 
 echo "==> 4. Installing Goose binary and goose-agent <=="
@@ -78,46 +78,18 @@ if [ ! -f "$GOOSE_AGENT_BIN" ]; then
 fi
 install -m 755 "$GOOSE_AGENT_BIN" "$MNT_DIR/usr/local/bin/goose-agent"
 
-echo "==> 5. Writing minimal init <=="
-# Written to /usr/local/sbin/micro-init and referenced via init= kernel parameter.
-# Network is already live via kernel ip= parameter injected by the host control plane.
-# goose-agent runs as PID 1 (via exec). When it exits, the guest kernel panics —
-# this is intentional: the panic is contained within the KVM hardware boundary and
-# does not affect the host OS. Firecracker catches the reboot signal and exits cleanly.
-# This panic-on-exit approach is simpler and safe enough for ephemeral VMs.
-mkdir -p "$MNT_DIR/usr/local/sbin"
-cat > "$MNT_DIR/usr/local/sbin/micro-init" << 'INIT_SCRIPT'
-#!/bin/sh
-mount -t proc  none /proc
-mount -t sysfs none /sys
-mount -t devtmpfs none /dev 2>/dev/null || true
-mkdir -p /dev/pts
-mount -t devpts none /dev/pts 2>/dev/null || true
-
-# Set essential environment variables that init systems normally provide.
-# Without HOME, goose cannot resolve ~/.config/goose/config.yaml.
-export HOME=/root
-export USER=root
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-# /etc/localtime is a symlink injected by the host control plane at VM launch
-# (pointing to /usr/share/zoneinfo/{tzname}). glibc reads it automatically
-# when TZ is unset, so no TZ export is needed here.
-
-# Non-interactive mode: if a task file was injected by the control plane,
-# pipe it to goose run. Otherwise fall back to interactive session (debug).
-# Persistent mode: goose-agent listens on :8080 and runs goose per request.
-# One-shot fallback: if task.txt was injected, run it once and exit.
-# Interactive fallback: neither present → open interactive session (debug only).
-if [ -f /usr/local/bin/goose-agent ]; then
-    exec /usr/local/bin/goose-agent
-elif [ -f /root/task.txt ]; then
-    exec /usr/local/bin/goose run -i - < /root/task.txt
-else
-    exec /usr/local/bin/goose
+echo "==> 5. Installing micro-init binary <=="
+# micro-init is a Go binary (cmd/micro-init/) pre-built by the daemon before this
+# script runs. It runs as PID 1, mounts virtual filesystems, starts goose-agent as
+# a child process, and calls poweroff(2) on exit — preventing the kernel panic that
+# would occur if PID 1 exited without a graceful shutdown sequence.
+MICRO_INIT_BIN="artifacts/micro-init"
+if [ ! -f "$MICRO_INIT_BIN" ]; then
+    echo "Error: $MICRO_INIT_BIN not found. The daemon builds it automatically." >&2
+    exit 1
 fi
-INIT_SCRIPT
-chmod +x "$MNT_DIR/usr/local/sbin/micro-init"
+mkdir -p "$MNT_DIR/usr/local/sbin"
+install -m 755 "$MICRO_INIT_BIN" "$MNT_DIR/usr/local/sbin/micro-init"
 
 printf 'goose-agent\n'                       > "$MNT_DIR/etc/hostname"
 printf '127.0.0.1\tlocalhost goose-agent\n'  > "$MNT_DIR/etc/hosts"

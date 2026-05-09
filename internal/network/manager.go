@@ -116,6 +116,78 @@ func (m *Manager) Allocate() (tapDevice string, guestIP string, macAddr string, 
 	return tapDevice, guestIP, macAddr, nil
 }
 
+// AllocateForRestore recreates a TAP device with the exact original name and MAC (required by
+// Firecracker's snapshot state.bin) and allocates any available IP from the pool.
+// The guest IP is reconfigured post-restore via vsock, so any free IP works.
+func (m *Manager) AllocateForRestore(tapDeviceName, macAddr string) (tapDevice string, guestIP string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Pick any available IP — the guest will be told its new IP via vsock after restore.
+	for _, ip := range m.ipList {
+		if !m.ipInUse[ip] {
+			guestIP = ip
+			m.ipInUse[ip] = true
+			break
+		}
+	}
+	if guestIP == "" {
+		return "", "", fmt.Errorf("no available IP addresses for restore")
+	}
+
+	// Parse tap ID to keep the pool consistent (prevent future collisions).
+	var tapID int
+	if _, scanErr := fmt.Sscanf(tapDeviceName, "tap%d", &tapID); scanErr != nil {
+		m.ipInUse[guestIP] = false
+		return "", "", fmt.Errorf("invalid tap device name %q: %w", tapDeviceName, scanErr)
+	}
+	for i, id := range m.freeTapIDs {
+		if id == tapID {
+			m.freeTapIDs = append(m.freeTapIDs[:i], m.freeTapIDs[i+1:]...)
+			break
+		}
+	}
+	if tapID >= m.nextTapID {
+		m.nextTapID = tapID + 1
+	}
+
+	log.Printf("Creating TAP device %s (restore) with IP %s and MAC %s...", tapDeviceName, guestIP, macAddr)
+	if err := m.createTapDeviceWithMAC(tapDeviceName, macAddr); err != nil {
+		m.ipInUse[guestIP] = false
+		return "", "", fmt.Errorf("failed to create TAP device for restore: %w", err)
+	}
+
+	return tapDeviceName, guestIP, nil
+}
+
+// createTapDeviceWithMAC creates a TAP device and sets its MAC address explicitly,
+// overriding the kernel-assigned default. Used for snapshot restoration where the
+// guest's eth0 already has the original MAC baked into its memory state.
+func (m *Manager) createTapDeviceWithMAC(tapName, macAddr string) error {
+	exec.Command("ip", "link", "delete", tapName).Run()
+
+	if err := exec.Command("ip", "tuntap", "add", tapName, "mode", "tap").Run(); err != nil {
+		return fmt.Errorf("failed to add tuntap %s: %w", tapName, err)
+	}
+
+	if err := exec.Command("ip", "link", "set", "dev", tapName, "address", macAddr).Run(); err != nil {
+		m.deleteTapDevice(tapName)
+		return fmt.Errorf("failed to set MAC %s on %s: %w", macAddr, tapName, err)
+	}
+
+	if err := exec.Command("ip", "link", "set", tapName, "master", m.bridgeName).Run(); err != nil {
+		m.deleteTapDevice(tapName)
+		return fmt.Errorf("failed to attach %s to bridge %s: %w", tapName, m.bridgeName, err)
+	}
+
+	if err := exec.Command("ip", "link", "set", tapName, "up").Run(); err != nil {
+		m.deleteTapDevice(tapName)
+		return fmt.Errorf("failed to bring up %s: %w", tapName, err)
+	}
+
+	return nil
+}
+
 func (m *Manager) Release(tapDevice string, guestIP string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -142,11 +142,20 @@ func (p *Provisioner) mountVMDisk(vmID string, fn func(mntDir string) error) err
 	return fn(mntDir)
 }
 
+// VMPrepareOptions carries all per-VM file injection parameters for PrepareVM.
+type VMPrepareOptions struct {
+	HostConfigPath  string // path to goose.yaml on the host
+	HostSecretsPath string // path to goose-secrets.yaml on the host
+	Task            string // optional task prompt written to /root/task.txt
+	AgentToken      string // if non-empty, written to /root/.ephemera-agent-token (mode 0600)
+}
+
 // PrepareVM injects all VM-specific files in a single mount/unmount cycle:
-//   - /root/.config/goose/config.yaml  (provider, model, extensions)
-//   - /root/.config/goose/secrets.yaml (API keys; requires GOOSE_DISABLE_KEYRING=true)
-//   - /root/task.txt                   (task prompt; read by micro-init via goose run -i -)
-func (p *Provisioner) PrepareVM(vmID, hostConfigPath, hostSecretsPath, task string) error {
+//   - /root/.config/goose/config.yaml       (provider, model, extensions)
+//   - /root/.config/goose/secrets.yaml      (API keys; requires GOOSE_DISABLE_KEYRING=true)
+//   - /root/task.txt                         (task prompt; optional)
+//   - /root/.ephemera-agent-token            (Bearer token for goose-agent auth; optional)
+func (p *Provisioner) PrepareVM(vmID string, opts VMPrepareOptions) error {
 	return p.mountVMDisk(vmID, func(mntDir string) error {
 		gooseConfigDir := filepath.Join(mntDir, "root", ".config", "goose")
 		if err := os.MkdirAll(gooseConfigDir, 0755); err != nil {
@@ -154,8 +163,8 @@ func (p *Provisioner) PrepareVM(vmID, hostConfigPath, hostSecretsPath, task stri
 		}
 
 		for _, pair := range []struct{ src, dst string }{
-			{hostConfigPath, "config.yaml"},
-			{hostSecretsPath, "secrets.yaml"},
+			{opts.HostConfigPath, "config.yaml"},
+			{opts.HostSecretsPath, "secrets.yaml"},
 		} {
 			if err := copyFile(pair.src, filepath.Join(gooseConfigDir, pair.dst)); err != nil {
 				return fmt.Errorf("failed to inject %s: %w", pair.dst, err)
@@ -163,10 +172,18 @@ func (p *Provisioner) PrepareVM(vmID, hostConfigPath, hostSecretsPath, task stri
 		}
 
 		// task is optional: empty means persistent mode (goose-agent handles requests).
-		if task != "" {
+		if opts.Task != "" {
 			taskPath := filepath.Join(mntDir, "root", "task.txt")
-			if err := os.WriteFile(taskPath, []byte(task), 0644); err != nil {
+			if err := os.WriteFile(taskPath, []byte(opts.Task), 0644); err != nil {
 				return fmt.Errorf("failed to write task.txt: %w", err)
+			}
+		}
+
+		// AgentToken is written with mode 0600 so only root can read it inside the VM.
+		if opts.AgentToken != "" {
+			tokenPath := filepath.Join(mntDir, "root", ".ephemera-agent-token")
+			if err := os.WriteFile(tokenPath, []byte(opts.AgentToken), 0600); err != nil {
+				return fmt.Errorf("failed to write agent token: %w", err)
 			}
 		}
 
@@ -234,6 +251,36 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return out.Close()
+}
+
+// EnsureMicroInit builds the micro-init binary into binaryPath if it doesn't exist.
+// micro-init runs as PID 1 inside each VM; it mounts virtual filesystems, starts
+// goose-agent as a child, and calls poweroff(2) on exit for graceful VM shutdown.
+func EnsureMicroInit(binaryPath, projectRoot string) error {
+	if _, err := os.Stat(binaryPath); err == nil {
+		log.Printf("micro-init found at %s.", binaryPath)
+		return nil
+	}
+
+	log.Printf("Building micro-init at %s ...", binaryPath)
+
+	if err := os.MkdirAll(filepath.Dir(binaryPath), 0755); err != nil {
+		return fmt.Errorf("failed to create artifacts dir: %w", err)
+	}
+
+	cmd := exec.Command("go", "build", "-o", binaryPath, "./cmd/micro-init/")
+	cmd.Dir = projectRoot
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64")
+
+	if err := cmd.Run(); err != nil {
+		os.Remove(binaryPath)
+		return fmt.Errorf("failed to build micro-init: %w", err)
+	}
+
+	log.Printf("micro-init built at %s.", binaryPath)
+	return nil
 }
 
 // EnsureGooseAgent builds the goose-agent binary into binaryPath if it doesn't exist.

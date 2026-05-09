@@ -26,14 +26,19 @@ vmlinux*
 *.log
 /tmp/*
 
-# 4. Goose runtime config (contains API keys)
+# 4. Runtime-generated directories
+/snapshots/
+/tmp/
+
+# 5. Goose runtime config (contains API keys)
 configs/goose.yaml
 configs/goose-secrets.yaml
 
-# 5. Claude Code context file
+# 6. Claude Code context file
 CLAUDE.md
+Handoff.md
 
-# 6. OS & Editor generated files
+# 7. OS & Editor generated files
 .vscode/
 .idea/
 .DS_Store

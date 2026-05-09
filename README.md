@@ -1,5 +1,6 @@
 # Ephemera
 
+[![CI](https://github.com/steve-seungeui/ephemera/actions/workflows/ci.yml/badge.svg)](https://github.com/steve-seungeui/ephemera/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/steve-seungeui/ephemera)](https://github.com/steve-seungeui/ephemera/releases)
 [![Go](https://img.shields.io/badge/Go-1.18+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -20,53 +21,86 @@ External Client
 Reverse Proxy  :443                   ← Caddy / Nginx (TLS termination)
       │  HTTP (Bearer token, encrypted inside TLS tunnel)
       ▼
-Ephemera Control Plane  :3000         ← VM lifecycle management
-  POST   /vms                         → spawn VM, return private IP + agent URL
+Ephemera Control Plane  :3000         ← VM lifecycle + snapshot management
+  POST   /vms                         → spawn VM → returns {vm_id, agent_url, agent_token}
   GET    /vms                         → list running VMs
   DELETE /vms/{vm_id}                 → stop & destroy VM
+  POST   /vms/{vm_id}/snapshot        → freeze VM state to disk
+  GET    /snapshots                   → list stored snapshots
+  POST   /snapshots/{id}/restore      → resume VM from snapshot (~5 s vs ~60 s cold boot)
+  DELETE /snapshots/{id}              → delete snapshot files
 
       │  provision
       ▼
 MicroVM (Firecracker + KVM)           ← isolated KVM hardware boundary
   ├── Debian Bookworm minbase (rootfs)
-  ├── micro-init  →  goose-agent :8080
+  ├── micro-init (PID 1)  →  goose-agent :8080
   └── goose (AI agent, runs per task)
 
 External Client
-      │  HTTP (direct to VM private IP — reachable from host only)
+      │  HTTP (via control plane proxy — no direct VM access needed)
       ▼
-goose-agent  http://10.0.1.x:8080    ← private subnet 10.0.1.0/24
+Control Plane  :3000  /vms/{vm_id}    ← proxies to VM's private agent
+  POST  /vms/{vm_id}/tasks            → proxy → goose-agent :8080/tasks
+  GET   /vms/{vm_id}/health           → proxy → goose-agent :8080/health
+  POST  /vms/{vm_id}/stop             → proxy → goose-agent :8080/stop
+
+goose-agent  http://10.0.1.x:8080    ← private subnet 10.0.1.0/24 (host-only)
   POST  /tasks    {"prompt":"..."}    → run a Goose task, return result
   GET   /health                       → idle | busy
   POST  /stop                         → graceful shutdown
 ```
 
+> `agent_url` in VM responses points to the control plane proxy when `EPHEMERA_PUBLIC_URL` is set, or to the VM's private IP otherwise. Direct access to the private IP still works from the host.
+
 ### VM Provisioning Flow
 
 ```
 CloneDisk()      → copy golden image → per-VM ext4 disk
-PrepareVM()      → inject config.yaml, secrets.yaml, /etc/localtime (single mount)
+PrepareVM()      → inject goose.yaml, goose-secrets.yaml, agent_token,
+                   /etc/localtime (single mount/unmount cycle)
 StartMachine()   → Firecracker: kernel + disk + TAP NIC
-                    network configured via kernel boot parameter ip=<IP>::<GW>:<mask>::eth0:off
-                    (no DHCP — IP is live before any user-space process starts)
-waitForAgent()   → poll http://10.0.1.x:8080/health until ready
+                   network via kernel ip= boot parameter (no DHCP)
+waitForAgent()   → poll http://10.0.1.x:8080/health until ready (~60 s cold boot)
 ```
+
+### Snapshot/Restore Flow
+
+```
+POST /vms/{id}/snapshot
+  → auto-detect type:
+      no prior Full for this VM → Full  (memory.bin = 2 GB, non-sparse)
+      prior Full exists         → Diff  (memory.bin = sparse, dirty pages only)
+  → PauseVM()         (freeze guest CPU execution)
+  → CreateSnapshot()  (write memory.bin + state.bin; Diff uses SnapshotType="Diff")
+  → CopyDisk()        (copy rootfs to snapshots/{id}/rootfs.ext4)
+  → ResumeVM()        (unfreeze guest, or destroy if stop_after=true)
+
+POST /snapshots/{id}/restore
+  → if Diff: MergeMemoryDiff(base.memory.bin, diff.memory.bin → tmp/merged.bin)
+  → SetupDMSnapshot() (COW restore: losetup × 2 + dmsetup snapshot → bind-mount;
+                        initial extra disk usage ≈ 0, writes-on-demand to sparse .cow file)
+  → AllocateForRestore() (recreate original TAP name + MAC; allocate any free IP)
+  → RestoreMachine()  (Firecracker loads snapshot; vsock device rebuilt from state.bin)
+  → ReconfigureGuestIP() (vsock: CHANGE_IP new_ip/24 → ip addr + ip route in guest)
+  → waitForAgent()    (poll /health at new IP, ~5 s)
+  → cleanup:          merged.bin deleted after VM starts;
+                      .cow exception store deleted on VM delete
+```
+
+> Firecracker v1.x stores the TAP device name and disk path inside `state.bin`. Restoration recreates the TAP with the original name and places the disk at the original path. The guest IP is reconfigured via vsock after restore.
 
 ### Teardown Flow
 
 ```
 DELETE /vms/{id}
-  → StopVMM()          (SIGTERM to Firecracker process)
-                        Firecracker terminates the VM; goose-agent (PID 1) exits,
-                        causing the guest kernel to panic. This is intentional:
-                        the panic is fully contained within the KVM hardware boundary
-                        and does not affect the host OS or other VMs.
-                        Firecracker intercepts the kexec reboot triggered by panic=1
-                        and exits cleanly (exit_code=0).
-                        The panic-on-exit approach is simpler and safe enough for
-                        ephemeral VMs — a wrapper init that handles SIGTERM and calls
-                        poweroff would be a more graceful alternative if needed.
-  → CleanupDisk()      (delete cloned ext4)
+  → StopVMM()          (SIGTERM to Firecracker → micro-init catches SIGTERM,
+                         calls sync + poweroff(2); guest shuts down gracefully)
+  → For COW-restored VMs:
+    TeardownDMSnapshot() (umount -l bind-mount → dmsetup remove → losetup -d × 2
+                           → rm sparse .cow exception store)
+  → For fresh VMs:
+    Remove disk        (delete cloned ext4 via stored diskPath)
   → Release()          (delete TAP device, return IP to pool)
 ```
 
@@ -74,13 +108,21 @@ DELETE /vms/{id}
 
 ## Key Features
 
-- **Self-bootstrapping**: golden image, kernel (`vmlinux-6.1.155`), and Firecracker (`v1.15.1`) are downloaded automatically on first run; Firecracker binary is SHA256-verified.
-- **Minimal guest OS**: Debian Bookworm `--variant=minbase` + tzdata + libgomp1. No SSH, no init daemon — `micro-init` mounts virtual filesystems and execs `goose-agent` directly as PID 1.
-- **Runtime config injection**: `goose.yaml` (provider, model) and `goose-secrets.yaml` (API keys) are injected into each VM's disk at provisioning time — no rebuild required to change config.
-- **Host timezone mirroring**: `/etc/localtime` symlink is injected per VM so Goose timestamps match the host.
-- **IP and TAP recycling**: IPs (10.0.1.2–254) and TAP IDs are returned to a pool and reused across VM lifecycle.
-- **NAT for outbound internet**: host bridge `goose-br0` with iptables MASQUERADE enables VM-to-internet connectivity (needed for LLM API calls).
-- **API authentication**: optional Bearer token (`EPHEMERA_API_TOKEN`); API binds to `127.0.0.1` by default.
+| Feature | Detail |
+|---------|--------|
+| **Self-bootstrapping** | Golden image, kernel, Firecracker downloaded + SHA256-verified on first run |
+| **Minimal guest OS** | Debian Bookworm minbase — no SSH, no init daemon; `micro-init` (Go binary, PID 1) mounts virtual filesystems and manages goose-agent lifecycle |
+| **Graceful guest shutdown** | `micro-init` traps SIGTERM and calls `poweroff(2)` — no kernel panic on VM exit |
+| **Per-VM LLM profiles** | Each VM spawn can specify a named profile (`configs/profiles/{name}/`) with its own provider, model, and API key |
+| **Runtime config injection** | `goose.yaml` and `goose-secrets.yaml` injected at provision time — no image rebuild required to change provider/model |
+| **Per-VM agent authentication** | Control plane generates a 32-byte random Bearer token per VM; token is written to the VM disk and returned once in `POST /vms` response |
+| **MicroVM snapshots (Full + Diff)** | Freeze VM memory state to disk; restore in ~5 s. First snapshot → Full (2 GB); subsequent snapshots of the same VM → Diff (sparse, dirty pages only). Diff is automatically selected; Full is always the reference base. Original agent token preserved across restores. |
+| **COW rootfs on restore** | Restored VMs use a Linux dm-snapshot COW device backed by the snapshot's `rootfs.ext4` (read-only base, shared). Per-VM guest writes accumulate in a sparse exception store (~0 initial disk usage). Eliminates the ~700 MB full copy previously required per restore. |
+| **Post-restore IP reconfiguration** | Restored VMs receive a fresh IP from the pool via vsock — the guest's network stack is updated in-place without reboot, decoupling the restore IP from the snapshot state. |
+| **IP and TAP recycling** | IPs (10.0.1.2–254) and TAP IDs are returned to a pool and reused across VM lifecycle |
+| **NAT for outbound internet** | Host bridge `goose-br0` with iptables MASQUERADE enables VM-to-internet for LLM API calls |
+| **Per-client API auth** | Named Bearer tokens per client (`alice:tok1,bob:tok2`); timing-safe comparison; per-request audit log |
+| **SIGHUP token hot reload** | API token list can be updated without restarting the daemon or interrupting running VMs |
 
 ---
 
@@ -90,30 +132,53 @@ DELETE /vms/{id}
 cmd/
   goose-daemon/       Control plane daemon (main binary)
     main.go           Startup, artifact bootstrap, ControlPlane init
-    api.go            ControlPlane HTTP API: /vms CRUD, VM lifecycle
-    config.go         Env-var configuration (ports, token, address)
+    api.go            HTTP API: VM + snapshot CRUD, auth middleware
+    config.go         Env-var configuration (ports, tokens, address)
   goose-agent/        In-VM HTTP agent (baked into golden image)
-    main.go           /tasks, /health, /stop endpoints
+    main.go           /tasks, /health, /stop  (Bearer token auth)
+  micro-init/         PID 1 for each MicroVM (baked into golden image)
+    main.go           Mounts virtual filesystems, manages goose-agent,
+                      calls poweroff(2) on exit
 
 internal/
-  vm/machine.go       Firecracker SDK wrapper, VMConfig, kernel args
-  network/manager.go  IP pool (sorted), TAP device lifecycle, bridge, NAT
+  vm/machine.go       Firecracker SDK wrapper — StartMachine, RestoreMachine
+  network/manager.go  IP pool, TAP device lifecycle, AllocateForRestore, bridge, NAT
   storage/
-    provisioner.go    Golden image bootstrap, disk clone, config/task injection,
-                      Firecracker/kernel download + SHA256 verification
+    provisioner.go    Golden image bootstrap, disk clone, config/token injection,
+                      artifact download + SHA256 verification
+    snapshot.go       Snapshot metadata (read/write), disk copy helpers,
+                      SetupDMSnapshot/TeardownDMSnapshot (COW restore via dm-snapshot),
+                      MergeMemoryDiff (SEEK_DATA/SEEK_HOLE sparse merge)
 
 configs/
-  goose.yaml.example       Provider, model, extensions template
-  goose-secrets.yaml.example  API key template
+  goose.yaml.example             Default provider/model template
+  goose-secrets.yaml.example     API key template
+  profiles/                      Per-VM LLM profiles (optional)
+    <profile-name>/
+      goose.yaml
+      goose-secrets.yaml
+
+.github/
+  workflows/ci.yml    go build + go vet + go test on push/PR (ubuntu-22.04)
+
+snapshots/            Stored snapshot directories (auto-created, gitignored)
+  <snapshot-id>/
+    memory.bin        Guest RAM dump — 2 GB (Full) or sparse/small (Diff)
+    state.bin         Firecracker hardware state
+    rootfs.ext4       Disk copy (always full, ~700 MB)
+    metadata.json     Restore params (IP, TAP, MAC, token, type, base_snapshot_id)
+
+e2e_test.sh           End-to-end integration test (50 steps; requires /dev/kvm + root)
 
 scripts/
-  build_image.sh      Builds golden image (Debian Bookworm + Goose + goose-agent)
+  build_image.sh      Builds golden image (Debian Bookworm + Goose + goose-agent + micro-init)
 
 artifacts/            Auto-populated at runtime (gitignored)
   golden-image.ext4   Golden VM disk image
   vmlinux.bin         Firecracker-compatible Linux 6.1 kernel
   firecracker         Firecracker VMM binary (SHA256-verified)
   goose-agent         In-VM HTTP agent binary (compiled from source)
+  micro-init          PID 1 init binary (compiled from source)
 ```
 
 ---
@@ -146,23 +211,23 @@ cd ephemera
 go build -o ephemera-daemon ./cmd/goose-daemon/
 ```
 
-### 2. Configure Goose
+### 2. Configure the default LLM
 
 ```bash
 cp configs/goose.yaml.example    configs/goose.yaml
 cp configs/goose-secrets.yaml.example configs/goose-secrets.yaml
 ```
 
-Edit `configs/goose.yaml` (provider, model):
+Edit `configs/goose.yaml`:
 
 ```yaml
 GOOSE_PROVIDER: google
-GOOSE_MODEL: gemini-flash-latest
+GOOSE_MODEL: gemini-2.5-flash
 GOOSE_TELEMETRY_ENABLED: false
 GOOSE_DISABLE_KEYRING: true   # required — MicroVM has no keyring daemon
 ```
 
-Edit `configs/goose-secrets.yaml` (API key — **never commit this file**):
+Edit `configs/goose-secrets.yaml` (**never commit this file**):
 
 ```yaml
 GOOGLE_API_KEY: "your-key-here"
@@ -177,11 +242,107 @@ sudo ./ephemera-daemon
 ```
 
 On first run, Ephemera will:
-1. Build the `goose-agent` binary
+1. Compile `micro-init` and `goose-agent` binaries
 2. Build the golden image via `debootstrap` (~5–8 minutes)
 3. Download the Firecracker kernel and binary
 
 Subsequent starts skip these steps if artifacts already exist.
+
+---
+
+## Testing
+
+Ephemera has two levels of testing.
+
+### Unit tests (CI)
+
+Run automatically on every push and pull request via GitHub Actions. No special hardware required.
+
+```bash
+go test ./...
+```
+
+Covers: API token parsing, LLM profile path resolution, agent auth middleware, token generation.
+
+### End-to-end test (`e2e_test.sh`)
+
+A full integration test that boots a real daemon, spawns actual Firecracker MicroVMs, and exercises every API endpoint. Requires a host with `/dev/kvm` and root privileges.
+
+```bash
+# Build first
+go build -o ephemera-daemon ./cmd/goose-daemon/
+
+# Run (takes ~15–30 minutes depending on API rate limits)
+sudo bash e2e_test.sh
+```
+
+**What it tests (50 steps):**
+
+| Steps | Scenario |
+|-------|----------|
+| 1–5 | Daemon startup, single VM lifecycle (create → task → stop → delete) |
+| 6–9 | Two VMs in parallel — concurrent task execution |
+| 11–17 | Full snapshot lifecycle: create with `stop_after`, list, restore, verify agent token and new IP, delete |
+| 19–24 | **Concurrent restore** — two different snapshots restored simultaneously; verifies both VMs run at the same time with independent IPs and disks |
+| 26–28 | **Diff snapshot creation** — auto-detection: first snapshot → `full`, second → `diff` with correct `base_snapshot_id` |
+| 29 | **Diff size verification** — `stat -c%b` confirms Diff `memory.bin` allocates fewer disk blocks than Full (sparse file) |
+| 30–32 | Diff snapshot restore — merged memory applied, agent responds, token preserved |
+| 33 | **Dependency protection** — deleting the Full base while Diff references it returns `409 Conflict` |
+| 34 | Ordered cleanup: delete Diff → delete Full (now unblocked) |
+| 36–37 | **COW rootfs** — create VM, take snapshot |
+| 38–40 | Restore via dm-snapshot: verify `/dev/mapper/cow-*` device active; exception store initially ≈ 0 MB actual disk usage |
+| 41 | Restored agent `/health` responds |
+| 42 | Delete restored VM: verify dm device, loop devices, and `.cow` file all cleaned up |
+| 43 | Delete snapshot and verify empty |
+| 45–47 | **Agent proxy** — `GET /vms/{id}/health`, `POST /vms/{id}/stop` via control plane proxy; no direct VM IP access |
+| 48–49 | **`EPHEMERA_PUBLIC_URL`** — restart daemon with var set; verify `agent_url` becomes proxy path; use `agent_url` for health + stop |
+| 50 | Daemon graceful shutdown |
+
+**Example output (passing, steps 41–50):**
+
+```
+━━━ 41. Verify COW-restored agent responds ━━━
+  ✓ COW-restored VM /health (HTTP 200)
+
+━━━ 42. Delete COW-restored VM and verify kernel resource cleanup ━━━
+  ✓ COW-restored VM /stop (HTTP 200)
+  ✓ DELETE COW-restored VM (HTTP 200)
+  ✓ dm-snapshot device removed after VM delete ✓
+  ✓ Exception store (.cow) removed after VM delete ✓
+
+━━━ 43. Delete COW snapshot ━━━
+  ✓ DELETE /snapshots/snap-... (HTTP 200)
+  ✓ Snapshot count after cleanup: 0
+
+━━━ 45. Create VM for agent proxy endpoint test ━━━
+  ✓ POST /vms (proxy-test) (HTTP 201)
+  ✓ Proxy-test VM: vm-...
+
+━━━ 46. Test proxy: GET /vms/$PROXY_VM_ID/health ━━━
+  ✓ GET /vms/vm-.../health (proxy) (HTTP 200)
+
+━━━ 47. Test proxy: POST /vms/$PROXY_VM_ID/stop ━━━
+  ✓ POST /vms/vm-.../stop (proxy) (HTTP 200)
+  ✓ DELETE proxy-test VM (HTTP 200)
+
+━━━ 48. Restart daemon with EPHEMERA_PUBLIC_URL=http://localhost:3000 ━━━
+  ✓ Daemon restarted with EPHEMERA_PUBLIC_URL
+  ✓ POST /vms (EPHEMERA_PUBLIC_URL test) (HTTP 201)
+  ✓ VM: vm-...  agent_url: http://localhost:3000/vms/vm-...
+  ✓ agent_url is proxy path ✓ (http://localhost:3000/vms/vm-...)
+
+━━━ 49. Verify proxy access via agent_url ━━━
+  ✓ $agent_url/health (via proxy) (HTTP 200)
+  ✓ $agent_url/stop (via proxy) (HTTP 200)
+  ✓ DELETE EPHEMERA_PUBLIC_URL test VM (HTTP 200)
+
+━━━ 50. Shut down daemon ━━━
+  ✓ Daemon stopped
+
+══════════════════════════════════
+  All test steps passed ✓
+══════════════════════════════════
+```
 
 ---
 
@@ -193,11 +354,12 @@ All settings are read from environment variables at startup.
 |----------|---------|-------------|
 | `EPHEMERA_API_ADDR` | `127.0.0.1:3000` | Control plane bind address. Set to `0.0.0.0:3000` when behind a reverse proxy. |
 | `EPHEMERA_API_PORT` | `3000` | Port only (used when `EPHEMERA_API_ADDR` is not set). |
-| `EPHEMERA_API_TOKENS` | *(unset)* | Per-client Bearer tokens: `alice:token1,bob:token2`. Preferred over the single-token variable. |
-| `EPHEMERA_API_TOKEN` | *(unset)* | Single Bearer token (backward-compatible fallback, treated as client name `default`). |
+| `EPHEMERA_API_TOKENS` | *(unset)* | Per-client Bearer tokens: `alice:token1,bob:token2`. Preferred. |
+| `EPHEMERA_API_TOKEN` | *(unset)* | Single Bearer token (backward-compatible fallback). |
 | `EPHEMERA_AGENT_PORT` | `8080` | Port goose-agent listens on inside each VM. |
+| `EPHEMERA_PUBLIC_URL` | *(unset)* | Externally-reachable base URL of the control plane (no trailing slash). When set, `agent_url` in VM responses uses the proxy path `{EPHEMERA_PUBLIC_URL}/vms/{vm_id}` instead of the VM's private IP. Example: `https://api.example.com`. |
 
-`EPHEMERA_API_ADDR` takes precedence over `EPHEMERA_API_PORT`.
+`EPHEMERA_API_ADDR` takes precedence over `EPHEMERA_API_PORT`. All variables are read at startup; use SIGHUP to reload tokens without restarting.
 
 ---
 
@@ -205,22 +367,37 @@ All settings are read from environment variables at startup.
 
 ### Control Plane API (`localhost:3000`)
 
+All endpoints require `Authorization: Bearer <token>` when tokens are configured.
+
+---
+
 #### Spawn a VM
+
+```
+POST /vms
+Content-Type: application/json
+
+{ "profile": "anthropic" }   ← optional; omit to use default config
+```
 
 ```bash
 curl -X POST http://localhost:3000/vms \
-  -H "Authorization: Bearer $TOKEN"
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"profile": "anthropic"}'
 ```
 
 ```json
 {
-  "vm_id":     "vm-1777776598887",
-  "guest_ip":  "10.0.1.10",
-  "agent_url": "http://10.0.1.10:8080"
+  "vm_id":       "vm-1778227813435",
+  "guest_ip":    "10.0.1.10",
+  "agent_url":   "http://10.0.1.10:8080",
+  "profile":     "anthropic",
+  "agent_token": "3f9a2c..."
 }
 ```
 
-The call blocks until `goose-agent` is ready inside the VM (~60 s).
+Blocks until `goose-agent` is ready (~60 s cold boot). `agent_token` is returned **only here** — store it, as it cannot be retrieved again.
 
 #### List VMs
 
@@ -231,22 +408,136 @@ curl http://localhost:3000/vms -H "Authorization: Bearer $TOKEN"
 #### Delete a VM
 
 ```bash
-curl -X DELETE http://localhost:3000/vms/vm-1777776598887 \
+curl -X DELETE http://localhost:3000/vms/vm-1778227813435 \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 ---
 
+#### Create a snapshot
+
+Freeze the running VM's memory state to disk.
+
+```
+POST /vms/{vm_id}/snapshot
+Content-Type: application/json
+
+{
+  "stop_after": false,   ← optional; true = destroy VM after snapshot (migration mode)
+  "type": ""             ← optional; "full" | "diff" | "" (auto, default)
+}
+```
+
+**Snapshot type auto-detection** (`type` omitted or `""`):
+
+| Condition | Result |
+|-----------|--------|
+| No prior Full snapshot for this VM | `full` — captures all 2 GB of guest RAM |
+| Prior Full snapshot exists | `diff` — captures only dirty pages since the last Full (sparse file, typically much smaller) |
+
+```bash
+# First snapshot → Full (auto)
+curl -X POST http://localhost:3000/vms/vm-1778227813435/snapshot \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json"
+
+# Second snapshot → Diff (auto, references the Full above)
+curl -X POST http://localhost:3000/vms/vm-1778227813435/snapshot \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json"
+```
+
+```json
+{
+  "snapshot_id":      "snap-1778227847573",
+  "source_vm_id":     "vm-1778227813435",
+  "profile":          "anthropic",
+  "snapshot_type":    "diff",
+  "base_snapshot_id": "snap-1778227840000",
+  "created_at":       "2026-05-08T08:10:50Z"
+}
+```
+
+Snapshot files are written to `snapshots/<snapshot_id>/`. For a Diff snapshot the `memory.bin` is a sparse file — only dirty pages consume actual disk blocks.
+
+#### List snapshots
+
+```bash
+curl http://localhost:3000/snapshots -H "Authorization: Bearer $TOKEN"
+```
+
+#### Restore a VM from snapshot
+
+```bash
+curl -X POST http://localhost:3000/snapshots/snap-1778227847573/restore \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "vm_id":              "vm-1778227851562",
+  "guest_ip":           "10.0.1.10",
+  "agent_url":          "http://10.0.1.10:8080",
+  "profile":            "anthropic",
+  "agent_token":        "3f9a2c...",
+  "source_snapshot_id": "snap-1778227847573"
+}
+```
+
+Restoration takes ~5 s (vs ~60 s cold boot). The `agent_token` is identical to the original VM's token — existing clients continue to work without reconfiguration.
+
+**Restore constraints:**
+- The original guest IP must be available (not in use by another VM)
+- Same-snapshot concurrent restores are not supported — the vsock UDS path is fixed in `state.bin` and would collide. Different-snapshot concurrent restores work correctly.
+
+#### Delete a snapshot
+
+```bash
+curl -X DELETE http://localhost:3000/snapshots/snap-1778227847573 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+> **Dependency rule**: A Full snapshot that is the base for one or more Diff snapshots cannot be deleted (returns `409 Conflict`). Delete all referencing Diff snapshots first.
+
+---
+
+### Agent Proxy (via Control Plane)
+
+The control plane proxies the three agent endpoints, making them accessible to external clients without direct access to the private VM subnet. Authentication uses the **control plane Bearer token** — the agent token is injected internally.
+
+```
+POST /vms/{vm_id}/tasks    → proxied to goose-agent /tasks
+GET  /vms/{vm_id}/health   → proxied to goose-agent /health  (no auth required)
+POST /vms/{vm_id}/stop     → proxied to goose-agent /stop
+```
+
+When `EPHEMERA_PUBLIC_URL` is configured, `agent_url` in VM responses points directly to the proxy base (`{EPHEMERA_PUBLIC_URL}/vms/{vm_id}`), so clients can use it as-is:
+
+```bash
+export EPHEMERA_PUBLIC_URL=https://api.example.com
+# agent_url in POST /vms response will be: https://api.example.com/vms/vm-...
+
+curl -X POST "$AGENT_URL/tasks" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Check system environment."}'
+```
+
+Without `EPHEMERA_PUBLIC_URL`, `agent_url` still contains the private IP, but the proxy paths (`/vms/{vm_id}/tasks` etc.) are always available on the control plane regardless.
+
+---
+
 ### goose-agent API (`http://<guest_ip>:8080`)
 
-Clients call the VM's private IP **directly** — the control plane does not proxy task traffic.
+Direct access to the VM's private IP — reachable from the host only. `POST /tasks` and `POST /stop` require the `agent_token` returned by `POST /vms` or `POST /snapshots/{id}/restore`. `GET /health` is always unauthenticated.
 
 #### Run a task
 
 ```bash
 curl -X POST http://10.0.1.10:8080/tasks \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Check my current system environment. Tell me the OS version, available disk space in the current directory."}'
+  -H "Authorization: Bearer $AGENT_TOKEN" \
+  -d '{"prompt": "Check my current system environment."}'
 ```
 
 ```json
@@ -262,26 +553,178 @@ curl http://10.0.1.10:8080/health
 # {"status":"idle"}  or  {"status":"busy"}
 ```
 
+No authentication required — used internally by the control plane's `waitForAgent` poller.
+
 #### Stop the agent
 
 ```bash
-curl -X POST http://10.0.1.10:8080/stop
+curl -X POST http://10.0.1.10:8080/stop \
+  -H "Authorization: Bearer $AGENT_TOKEN"
 ```
 
-Gracefully shuts down `goose-agent`. The VM's kernel then panics (PID 1 exited) and Firecracker exits. Use `DELETE /vms/{id}` afterwards to release host resources.
+Shuts down `goose-agent`. `micro-init` (PID 1) then calls `sync` + `poweroff(2)`, triggering a clean Firecracker exit. Call `DELETE /vms/{id}` afterwards to release host resources.
+
+---
+
+## Per-VM LLM Profiles
+
+Profiles allow each VM to use a different LLM provider or model without modifying the default config. API keys stay on the server — clients only pass a profile name.
+
+### Setup
+
+Create one subdirectory per profile under `configs/profiles/`:
+
+```
+configs/
+  profiles/
+    anthropic/
+      goose.yaml           ← GOOSE_PROVIDER: anthropic, GOOSE_MODEL: claude-sonnet-4-6
+      goose-secrets.yaml   ← ANTHROPIC_API_KEY: sk-ant-...
+    openai/
+      goose.yaml
+      goose-secrets.yaml
+```
+
+### Usage
+
+```bash
+# Spawn VM with the 'anthropic' profile
+curl -X POST http://localhost:3000/vms \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"profile": "anthropic"}'
+```
+
+Omitting `profile` (or sending an empty body) uses `configs/goose.yaml` and `configs/goose-secrets.yaml`.
+
+---
+
+## Diff Snapshots (Multi-Checkpoint)
+
+Diff snapshots capture only the memory pages dirtied since the last Full snapshot, reducing storage cost for repeated checkpointing of a long-running VM.
+
+### Storage comparison
+
+| Scenario | Full × N | With Diff |
+|----------|----------|-----------|
+| 3 checkpoints | 3 × 2.7 GB = **8.1 GB** | 2.7 GB + 2 × ~0.9 GB = **4.5 GB** |
+| 5 checkpoints | 5 × 2.7 GB = **13.5 GB** | 2.7 GB + 4 × ~0.9 GB = **6.3 GB** |
+
+*Diff size depends on actual memory activity; typical Goose workloads dirty 10–20% of RAM.*
+
+### How it works
+
+```
+VM starts (TrackDirtyPages=true in MachineConfiguration)
+
+POST /vms/{id}/snapshot          ← first call
+  snapshot_type: "full"          ← 2 GB memory.bin
+
+... VM runs tasks, dirties pages ...
+
+POST /vms/{id}/snapshot          ← second call (auto-detects prior Full)
+  snapshot_type: "diff"          ← sparse memory.bin, only dirty pages
+  base_snapshot_id: snap-xxx     ← references the Full above
+
+POST /snapshots/{diff-id}/restore
+  → MergeMemoryDiff(full.memory.bin + diff.memory.bin → tmp/merged.bin)
+  → RestoreMachine(merged.bin, diff.state.bin)
+  → os.Remove(merged.bin)        ← temp file cleaned up after VM starts
+```
+
+> **Disk space during restore**: the merge step writes a temporary 2 GB `merged.bin` alongside the existing base and diff files. Ensure the host has at least 2 GB of free space in the Ephemera working directory before restoring a diff snapshot. The file is removed as soon as Firecracker has opened it.
+
+### Dependency rule
+
+A Full snapshot referenced by one or more Diff snapshots is **protected from deletion**:
+
+```bash
+# Will fail with 409 Conflict while diff exists
+curl -X DELETE http://localhost:3000/snapshots/$FULL_SNAP_ID
+
+# Correct order: delete Diff first
+curl -X DELETE http://localhost:3000/snapshots/$DIFF_SNAP_ID
+curl -X DELETE http://localhost:3000/snapshots/$FULL_SNAP_ID  # now succeeds
+```
+
+### Explicit type override
+
+```bash
+# Force a full snapshot even if a prior Full exists
+curl -X POST http://localhost:3000/vms/$VMID/snapshot \
+  -H "Content-Type: application/json" \
+  -d '{"type": "full"}'
+
+# Force a diff snapshot (returns 400 if no Full exists)
+curl -X POST http://localhost:3000/vms/$VMID/snapshot \
+  -H "Content-Type: application/json" \
+  -d '{"type": "diff"}'
+```
+
+---
+
+## COW Rootfs Restore
+
+When restoring a VM from a snapshot, Ephemera uses Linux **device mapper snapshot** (dm-snapshot) to create a block-level copy-on-write view of the snapshot's `rootfs.ext4`. This eliminates the ~700 MB full disk copy that was previously required per restore.
+
+### How it works
+
+```
+snapshots/<id>/rootfs.ext4   (read-only base, shared across all restores of this snapshot)
+        │
+  losetup -r --find → /dev/loopX      (read-only loop device for base)
+  truncate -s 8G   → vm-{id}.cow      (sparse exception store, ~0 bytes initially)
+  losetup --find   → /dev/loopY      (read-write loop device for exception store)
+        │
+  dmsetup create cow-vm-{id}.cow
+    --table "0 <sectors> snapshot /dev/loopX /dev/loopY P 8"
+        │
+  /dev/mapper/cow-vm-{id}.cow         (COW block device)
+        │
+  mount --bind /dev/mapper/cow-{id}   (over original disk path from state.bin)
+  /tmp/goose-workspaces/vm-{orig}.ext4
+        │
+  Firecracker opens the path → reads base, writes go to .cow
+```
+
+- **Base**: `rootfs.ext4` in the snapshot directory (read-only, never modified)
+- **Exception store** (`vm-{id}.cow`): 8 GB sparse file; actual disk blocks allocated only on VM write
+- **Initial extra disk usage**: ~0 MB (16 × 512-byte blocks for dm-snapshot metadata)
+
+### Disk usage comparison
+
+| Restores | Before (full copy per restore) | After (COW) |
+|----------|-------------------------------|-------------|
+| 1 restore | +700 MB | +~0 MB |
+| 5 concurrent restores | +5 × 700 MB = **3.5 GB** | +5 × ~0 MB = **~0 MB** |
+| After 1 GB of VM writes | +700 MB | +~1 GB |
+
+### Cleanup
+
+When a COW-restored VM is deleted:
+
+```
+TeardownDMSnapshot()
+  → umount -l <original disk path>   (lazy unmount — safe if Firecracker still holds fd)
+  → dmsetup remove cow-vm-{id}.cow   (retries up to 5× for Firecracker fd release)
+  → losetup -d /dev/loopY            (detach COW loop device)
+  → losetup -d /dev/loopX            (detach base loop device)
+  → rm vm-{id}.cow                   (delete sparse exception store)
+```
+
+### Fallback
+
+If dm-snapshot setup fails (e.g., `dmsetup` unavailable), the control plane automatically falls back to the original bind-mount approach (full 700 MB disk copy per restore) and logs the reason.
 
 ---
 
 ## Security
 
-### API authentication
+### Control plane API authentication
 
 #### Per-client tokens (recommended)
 
-Issue a separate token for each caller so individual clients can be revoked without affecting others. Each request is logged with the matching client name for auditing.
-
 ```bash
-# Generate tokens for each client
 ALICE_TOKEN=$(openssl rand -hex 32)
 BOB_TOKEN=$(openssl rand -hex 32)
 
@@ -289,49 +732,61 @@ export EPHEMERA_API_TOKENS="alice:$ALICE_TOKEN,bob:$BOB_TOKEN"
 sudo -E ./ephemera-daemon
 ```
 
-Startup log confirms registered clients:
-
+Startup log:
 ```
 Control plane API on 127.0.0.1:3000  (auth: Bearer token (2 client(s): alice, bob))
 ```
 
 Each request is logged with the authenticated client name:
-
 ```
 [alice] POST /vms
 [bob]   GET  /vms
 ```
 
-#### Single-token fallback (backward-compatible)
+#### Single-token fallback
 
 ```bash
 export EPHEMERA_API_TOKEN=$(openssl rand -hex 32)
 sudo -E ./ephemera-daemon
 ```
 
-Treated internally as a single client named `default`.
+Treated as a single client named `default`.
 
 If neither variable is set, a startup warning is logged and the API is unauthenticated — **never expose the control plane without a token**.
 
-#### Known limitation: token changes require a daemon restart
+#### Token hot reload (SIGHUP)
 
-Tokens are loaded once at startup from environment variables. Adding, rotating, or revoking a token requires restarting the daemon, which **destroys all running VMs** (`DestroyAll` is called on exit). Planned improvement: SIGHUP-based hot reload that re-reads the token configuration without stopping running VMs.
+API tokens can be updated without restarting the daemon or interrupting running VMs:
 
-Operational implications:
+```bash
+# Update the environment variable and send SIGHUP
+export EPHEMERA_API_TOKENS="alice:$NEW_ALICE,carol:$CAROL_TOKEN"
+kill -HUP $(pgrep ephemera-daemon)
+```
 
-| Scenario | Impact |
+The daemon re-reads `EPHEMERA_API_TOKENS` / `EPHEMERA_API_TOKEN` and swaps the in-memory client list. All running VMs continue unaffected.
+
+| Scenario | Action |
 |----------|--------|
-| Adding a new client | Plan restart during a maintenance window |
-| Periodic token rotation | Schedule when no long-running VMs are active |
-| Emergency revocation (token compromised) | Restart immediately; accept VM interruption as unavoidable |
+| Adding a new client | Update env var → SIGHUP |
+| Rotating a token | Update env var → SIGHUP |
+| Emergency revocation | Update env var → SIGHUP — **no VM interruption** |
+
+---
+
+### goose-agent authentication
+
+Each VM's agent is protected by a unique 32-byte random Bearer token generated at spawn time and written to `/root/.ephemera-agent-token` (mode `0600`) inside the VM disk. The token is returned once in the `POST /vms` response (and again in `POST /snapshots/{id}/restore`).
+
+- `POST /tasks` and `POST /stop` require `Authorization: Bearer <agent_token>`
+- `GET /health` is always open (used by the control plane's internal health poller)
+- The token is tied to the VM's disk and persists across snapshot/restore cycles
 
 ---
 
 ### TLS and network exposure
 
-By default the control plane binds to `127.0.0.1:3000` (localhost only). Bearer tokens are sent in HTTP headers; without TLS they are transmitted in plaintext and can be captured by anyone on the network path.
-
-**Placing a TLS-terminating reverse proxy in front solves the plaintext problem**: TLS encrypts the entire TCP payload (including HTTP headers) before transmission, so the Bearer token is never visible on the wire.
+By default the control plane binds to `127.0.0.1:3000` (localhost only). Place a TLS-terminating reverse proxy in front for external access.
 
 #### Step 1 — allow external binding
 
@@ -344,12 +799,7 @@ sudo -E ./ephemera-daemon
 
 **Caddy** (automatic HTTPS via Let's Encrypt — recommended):
 
-```bash
-sudo apt-get install -y caddy
-```
-
 `/etc/caddy/Caddyfile`:
-
 ```
 api.example.com {
     reverse_proxy localhost:3000
@@ -357,21 +807,13 @@ api.example.com {
 ```
 
 ```bash
+sudo apt-get install -y caddy
 sudo systemctl restart caddy
 ```
 
-Caddy obtains and renews TLS certificates automatically.
-
----
-
-**Nginx** (manual certificate required):
-
-```bash
-sudo apt-get install -y nginx
-```
+**Nginx** (manual certificate):
 
 `/etc/nginx/sites-available/ephemera`:
-
 ```nginx
 server {
     listen 443 ssl;
@@ -385,7 +827,7 @@ server {
         proxy_pass         http://127.0.0.1:3000;
         proxy_set_header   Host $host;
         proxy_set_header   X-Real-IP $remote_addr;
-        proxy_read_timeout 120s;   # POST /vms blocks ~60 s waiting for goose-agent
+        proxy_read_timeout 300s;   # POST /vms/*/snapshot can take several minutes
     }
 }
 
@@ -405,17 +847,26 @@ sudo nginx -t && sudo systemctl restart nginx
 
 ```bash
 curl -X POST https://api.example.com/vms \
-  -H "Authorization: Bearer $ALICE_TOKEN"
+  -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json"
 ```
-
-The goose-agent (`:8080`) runs on a private VM subnet (`10.0.1.0/24`) reachable only from the host. It is not directly exposed to external networks.
 
 ### VM isolation
 
 - Each VM runs in a separate KVM hardware boundary.
 - Each VM gets a **cloned** rootfs — no shared filesystem state between VMs.
-- On teardown: TAP device deleted, disk wiped, IP returned to pool.
-- Goose config and API keys are injected at provisioning time and exist only inside the ephemeral VM disk.
+- Goose config and API keys are injected at provision time and exist only inside the ephemeral VM disk.
+- On teardown: `micro-init` calls `poweroff(2)`, TAP device is deleted, disk is wiped, IP is returned to pool.
+
+---
+
+## Known Limitations
+
+| Limitation | Detail |
+|------------|--------|
+| **Single-host** | All VMs run on one physical host. Multi-host clustering is not supported. |
+| **Same-snapshot concurrent restores not supported** | The guest IP is reconfigured via vsock after restore, so different-snapshot concurrent restores each get a fresh IP. However, two VMs from the *same* snapshot would still collide on the Firecracker vsock UDS path (which is fixed in `state.bin`), so same-snapshot concurrent restores are not supported. |
+| **Cross-machine restore** | Supported manually: copy the `snapshots/<id>/` directory to the target host at the same absolute path, then call `POST /snapshots/{id}/restore`. Automated transfer is not built in. |
 
 ---
 

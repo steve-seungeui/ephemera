@@ -27,9 +27,15 @@ func main() {
 	buildScriptPath  := filepath.Join(cwd, "scripts/build_image.sh")
 	kernelPath       := filepath.Join(cwd, "artifacts/vmlinux.bin")
 	firecrackerPath  := filepath.Join(cwd, "artifacts/firecracker")
+	microInitPath    := filepath.Join(cwd, "artifacts/micro-init")
 	gooseAgentPath   := filepath.Join(cwd, "artifacts/goose-agent")
 	gooseConfigPath  := filepath.Join(cwd, "configs/goose.yaml")
 	gooseSecretsPath := filepath.Join(cwd, "configs/goose-secrets.yaml")
+	snapshotDir      := filepath.Join(cwd, "snapshots")
+
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+		log.Fatalf("Fatal: failed to create snapshot directory: %v", err)
+	}
 
 	const (
 		kernelDownloadURL      = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155"
@@ -37,7 +43,12 @@ func main() {
 		firecrackerSHA256      = "d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a"
 	)
 
-	// 1. Build goose-agent (included in the golden image).
+	// 1. Build in-VM binaries (included in the golden image).
+	log.Println("Ensuring micro-init binary...")
+	if err := storage.EnsureMicroInit(microInitPath, cwd); err != nil {
+		log.Fatalf("Fatal: %v", err)
+	}
+
 	log.Println("Ensuring goose-agent binary...")
 	if err := storage.EnsureGooseAgent(gooseAgentPath, cwd); err != nil {
 		log.Fatalf("Fatal: %v", err)
@@ -68,7 +79,7 @@ func main() {
 	cp := NewControlPlane(
 		provisioner, netManager,
 		kernelPath, firecrackerPath, gooseConfigPath, gooseSecretsPath,
-		cwd,
+		cwd, snapshotDir,
 	)
 	defer cp.DestroyAll()
 
@@ -79,9 +90,16 @@ func main() {
 	}()
 	defer cp.Shutdown()
 
-	// 5. Wait for termination.
+	// 5. Wait for termination. SIGHUP reloads API tokens without restarting.
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	for {
+		sig := <-sigChan
+		if sig == syscall.SIGHUP {
+			cp.ReloadClients()
+			continue
+		}
+		break
+	}
 	log.Println("Shutting down...")
 }

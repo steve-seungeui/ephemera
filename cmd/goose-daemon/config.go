@@ -30,6 +30,13 @@ var (
 	// Set EPHEMERA_API_ADDR=0.0.0.0:3000 to bind on all interfaces.
 	apiAddr = resolveAPIAddr()
 
+	// publicURL is the externally-reachable base URL of the control plane
+	// (no trailing slash). When set, agent_url in VM responses points to the
+	// control plane proxy path ("{publicURL}/vms/{vm_id}") instead of the
+	// VM's private IP. Example: "https://api.example.com"
+	// Set via EPHEMERA_PUBLIC_URL env var.
+	publicURL = strings.TrimRight(os.Getenv("EPHEMERA_PUBLIC_URL"), "/")
+
 	// apiClients is the set of authorized callers loaded once at startup.
 	// Populated from EPHEMERA_API_TOKENS (multi-client) or EPHEMERA_API_TOKEN
 	// (single-client fallback). Empty = authentication disabled.
